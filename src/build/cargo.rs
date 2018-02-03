@@ -146,10 +146,15 @@ fn run_cargo(
                 // TODO: Return client notifications along with diagnostics to inform the user
                 let cur_pkg_targets = ws.current()?.targets();
 
-                if let &Some(ref build_bin) = rls_config.build_bin.as_ref() {
-                    let mut bins = cur_pkg_targets.iter().filter(|x| x.is_bin());
-                    if let None = bins.find(|x| x.name() == build_bin) {
-                        warn!("cargo - couldn't find binary `{}` specified in `build_bin` configuration", build_bin);
+                if let &Some(ref bins_to_build) = rls_config.bins.as_ref() {
+                    let mut existing_bins = cur_pkg_targets.iter().filter(|x| x.is_bin());
+                    for bin in bins_to_build {
+                        if let None = existing_bins.find(|x| x.name() == bin) {
+                            warn!(
+                                "cargo - couldn't find binary `{}` specified in `bins` configuration",
+                                bin
+                            );
+                        }
                     }
                 }
             }
@@ -163,17 +168,16 @@ fn run_cargo(
         target: opts.target.as_ref().map(|t| &t[..]),
         spec,
         filter: CompileFilter::new(
-            opts.lib,
-            &opts.bin,
-            opts.bins,
-            // TODO: Support more crate target types
-            &[],
-            false,
-            &[],
-            false,
-            &[],
-            false,
-            false,
+            opts.lib_only,
+            &opts.bins,
+            opts.all_bins,
+            &opts.tsts,
+            opts.all_tsts,
+            &opts.exms,
+            opts.all_exms,
+            &opts.bens,
+            opts.all_bens,
+            opts.all_targets,
         ),
         features: &opts.features,
         all_features: opts.all_features,
@@ -414,8 +418,8 @@ impl Executor for RlsExecutor {
             // assume crate_type arg (i.e. in `cargo test` it isn't specified for --test targets)
             // and build test harness only for final crate type
             let crate_type = crate_type.expect("no crate-type in rustc command line");
-            let build_lib = *config.build_lib.as_ref();
-            let is_final_crate_type = crate_type == "bin" || (crate_type == "lib" && build_lib);
+            let lib_only = *config.lib_only.as_ref();
+            let is_final_crate_type = crate_type == "bin" || (crate_type == "lib" && lib_only);
 
             if config.cfg_test {
                 // FIXME(#351) allow passing --test to lib crate-type when building a dependency
@@ -505,9 +509,16 @@ impl Executor for RlsExecutor {
 #[derive(Debug)]
 struct CargoOptions {
     target: Option<String>,
-    lib: bool,
-    bin: Vec<String>,
-    bins: bool,
+    lib_only: bool,
+    bins: Vec<String>,
+    all_bins: bool,
+    tsts: Vec<String>,
+    all_tsts: bool,
+    exms: Vec<String>,
+    all_exms: bool,
+    bens: Vec<String>,
+    all_bens: bool,
+    all_targets: bool,
     all_features: bool,
     no_default_features: bool,
     features: Vec<String>,
@@ -518,9 +529,16 @@ impl Default for CargoOptions {
     fn default() -> CargoOptions {
         CargoOptions {
             target: None,
-            lib: false,
-            bin: vec![],
-            bins: false,
+            lib_only: false,
+            bins: vec![],
+            all_bins: false,
+            tsts: vec![],
+            all_tsts: false,
+            exms: vec![],
+            all_exms: false,
+            bens: vec![],
+            all_bens: false,
+            all_targets: false,
             all_features: false,
             no_default_features: false,
             features: vec![],
@@ -543,21 +561,29 @@ impl CargoOptions {
         } else {
             // In single-crate mode we currently support only one crate target,
             // and if lib is set, then we ignore bin target config
-            let (lib, bin) = match *config.build_lib.as_ref() {
+            let (lib_only, bins) = match *config.lib_only.as_ref() {
                 true => (true, vec![]),
                 false => {
-                    let bin = match *config.build_bin.as_ref() {
-                        Some(ref bin) => vec![bin.clone()],
+                    let bins = match *config.bins.as_ref() {
+                        Some(ref bins) => bins.clone(),
                         None => vec![],
                     };
-                    (false, bin)
+                    (false, bins)
                 }
             };
 
             CargoOptions {
-                lib,
-                bin,
                 target: config.target.clone(),
+                lib_only: lib_only,
+                bins: bins,
+                all_bins: config.all_bins,
+                tsts: config.tsts.clone(),
+                all_tsts: config.all_tsts,
+                exms: config.exms.clone(),
+                all_exms: config.all_exms,
+                bens: config.bens.clone(),
+                all_bens: config.all_bens,
+                all_targets: config.all_targets,
                 features: config.features.clone(),
                 all_features: config.all_features,
                 no_default_features: config.no_default_features,

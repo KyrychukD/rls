@@ -782,7 +782,7 @@ fn test_multiple_binaries() {
     ];
 
     env.with_config(|c| {
-        c.build_bin = Inferrable::Specified(Some("bin2".to_owned()))
+        c.bins = Inferrable::Specified(Some(vec!["bin2".to_owned()]))
     });
     let (mut server, results) = env.mock_server(messages);
     // Initialize and build.
@@ -858,7 +858,7 @@ fn test_bin_lib_project() {
 
     env.with_config(|c| {
         c.cfg_test = true;
-        c.build_bin = Inferrable::Specified(Some("bin_lib".into()));
+        c.bins = Inferrable::Specified(Some(vec!["bin_lib".into()]));
     });
     let (mut server, results) = env.mock_server(messages);
     // Initialize and build.
@@ -1477,4 +1477,92 @@ fn test_deglob() {
             ExpectedMessage::new(Some(1200)).expect_contains(r#"null"#),
         ],
     );
+}
+
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn parsed_config_needs_inference_if_inferrable_properties_are_not_included() {
+        let config_json = "{}";
+        let config: Config = serde_json::from_str(config_json).unwrap();
+        assert_eq!(config.needs_inference(), true);
+    }
+
+    #[test]
+    fn parsed_config_does_not_need_inference_if_inferrable_properties_are_included() {
+        let config_json = "{
+            \"lib_only\": true,
+            \"bins\": []
+        }";
+        let config: Config = serde_json::from_str(config_json).unwrap();
+        assert_eq!(config.needs_inference(), false);
+    }
+
+    #[test]
+    fn build_lib_is_propagated_when_lib_only_is_not_specified() {
+        let mut main_config = Config::default();
+        assert_eq!(main_config.lib_only, Inferrable::None);
+
+        let json = "{
+            \"lib_only\": null,
+            \"build_lib\": true
+        }";
+        let new_config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(new_config.build_lib, Some(true));
+
+        main_config.update(new_config);
+        assert_eq!(main_config.lib_only, Inferrable::Specified(true));
+    }
+
+    #[test]
+    fn build_lib_is_ignored_when_lib_only_is_specified() {
+        let mut main_config = Config::default();
+        assert_eq!(main_config.lib_only, Inferrable::None);
+
+        let json = "{
+            \"lib_only\": false,
+            \"build_lib\": true
+        }";
+        let new_config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(new_config.lib_only, Inferrable::Specified(false));
+        assert_eq!(new_config.build_lib, Some(true));
+
+        main_config.update(new_config);
+        // Still `false` even though `build_lib` is `true`.
+        assert_eq!(main_config.lib_only, Inferrable::Specified(false));
+    }
+
+    #[test]
+    fn build_bin_is_propagated_when_bins_are_not_specified() {
+        let mut main_config = Config::default();
+        assert_eq!(main_config.bins, Inferrable::None);
+
+        let json = "{
+            \"build_bin\": \"my-program\"
+        }";
+        let new_config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(new_config.build_bin, Some("my-program".to_owned()));
+
+        main_config.update(new_config);
+        assert_eq!(main_config.bins, Inferrable::Specified(Some(vec!["my-program".to_owned()])));
+    }
+
+    #[test]
+    fn build_bin_is_ignored_when_bins_are_specified() {
+        let mut main_config = Config::default();
+        assert_eq!(main_config.bins, Inferrable::None);
+
+        let json = "{
+            \"build_bin\": \"my-program\",
+            \"bins\": [\"my-other-program\"]
+        }";
+        let new_config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(new_config.bins, Inferrable::Specified(Some(vec!["my-other-program".to_owned()])));
+        assert_eq!(new_config.build_bin, Some("my-program".to_owned()));
+
+        main_config.update(new_config);
+        // Still `my-other-program` even though `build_bin` is `my-program`.
+        assert_eq!(main_config.bins, Inferrable::Specified(Some(vec!["my-other-program".to_owned()])));
+    }
 }

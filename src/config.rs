@@ -38,7 +38,7 @@ const DEFAULT_WAIT_TO_BUILD: u64 = 500;
 /// `Specified` variant for the deserialized values. For user-provided `None`
 /// values, they must be `Inferred` prior to usage (and can be further
 /// `Specified` by the user).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum Inferrable<T> {
     /// Explicitly specified value by the user. Retrieved by deserializing a
     /// non-`null` value. Can replace every other variant.
@@ -69,13 +69,20 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Inferrable<T> {
 impl<T: Clone + Debug> Inferrable<T> {
     /// Combine these inferrable values, preferring our own specified values
     /// when possible, and falling back the given default value.
-    pub fn combine_with_default(&self, new: &Self, default: T) -> Self {
-        match (self, new) {
-            // Don't allow to update a Specified value with an Inferred one
-            (&Inferrable::Specified(_), &Inferrable::Inferred(_)) => self.clone(),
+    pub fn combine_with_default(&self, new: &Self, default: Self) -> Self {
+        match (self, new, &default) {
+            // Don't allow to update a Specified value with a new Inferred
+            (&Inferrable::Specified(_), &Inferrable::Inferred(_), &Inferrable::Inferred(_)) => {
+                self.clone()
+            }
+            // But pick up Specified default value (which most likely is either
+            // `build_lib` or `build_bin` specified by an outdated cient).
+            (&Inferrable::Specified(_), &Inferrable::Inferred(_), &Inferrable::Specified(_)) => {
+                default
+            }
             // When trying to update with a `None`, use Inferred variant with
             // a specified default value, as `None` value can't be used directly
-            (_, &Inferrable::None) => Inferrable::Inferred(default),
+            (_, &Inferrable::None, _) => default,
             _ => new.clone(),
         }
     }
@@ -111,9 +118,20 @@ impl<T> AsRef<T> for Inferrable<T> {
 pub struct Config {
     pub sysroot: Option<String>,
     pub target: Option<String>,
+    pub lib_only: Inferrable<bool>,
+    pub bins: Inferrable<Option<Vec<String>>>,
+    pub all_bins: bool,
+    pub tsts: Vec<String>,
+    pub all_tsts: bool,
+    pub exms: Vec<String>,
+    pub all_exms: bool,
+    pub bens: Vec<String>,
+    pub all_bens: bool,
+    pub all_targets: bool,
     pub rustflags: Option<String>,
-    pub build_lib: Inferrable<bool>,
-    pub build_bin: Inferrable<Option<String>>,
+    // `build_lib` and `build_bin` are deprecated. Use `lib_only` and `bins` instead.
+    pub build_lib: Option<bool>,
+    pub build_bin: Option<String>,
     pub cfg_test: bool,
     pub unstable_features: bool,
     pub wait_to_build: u64,
@@ -139,9 +157,19 @@ impl Default for Config {
         let mut result = Config {
             sysroot: None,
             target: None,
+            lib_only: Inferrable::None,
+            bins: Inferrable::None,
+            all_bins: false,
+            tsts: vec![],
+            all_tsts: false,
+            exms: vec![],
+            all_exms: false,
+            bens: vec![],
+            all_bens: false,
+            all_targets: false,
             rustflags: None,
-            build_lib: Inferrable::Inferred(false),
-            build_bin: Inferrable::Inferred(None),
+            build_lib: None,
+            build_bin: None,
             cfg_test: false,
             unstable_features: false,
             wait_to_build: DEFAULT_WAIT_TO_BUILD,
@@ -165,8 +193,19 @@ impl Default for Config {
 impl Config {
     /// Join this configuration with the new config.
     pub fn update(&mut self, mut new: Config) {
-        new.build_lib = self.build_lib.combine_with_default(&new.build_lib, false);
-        new.build_bin = self.build_bin.combine_with_default(&new.build_bin, None);
+        // Fallbacks for clients that haven't switched to `lib_only` and `bins` parameters.
+        let lib_only_fallback = match new.build_lib {
+            Some(value) => Inferrable::Specified(value),
+            None => Inferrable::Inferred(false),
+        };
+        let bins_fallback = match new.build_bin {
+            Some(ref bin_name) => Inferrable::Specified(Some(vec![bin_name.clone()])),
+            None => Inferrable::Inferred(None),
+        };
+
+        new.lib_only = self.lib_only
+            .combine_with_default(&new.lib_only, lib_only_fallback);
+        new.bins = self.bins.combine_with_default(&new.bins, bins_fallback);
 
         *self = new;
     }
@@ -192,14 +231,28 @@ impl Config {
 
     /// Is this config incomplete, and needs additional values to be inferred?
     pub fn needs_inference(&self) -> bool {
-        match (&self.build_lib, &self.build_bin) {
+        match (&self.lib_only, &self.bins) {
             (&Inferrable::None, _) | (_, &Inferrable::None) => true,
             _ => false,
         }
     }
 
+    /// Is at least one user-specified filter enabled?
+    fn user_specified_filter_exists(&self) -> bool {
+        self.all_bins || self.all_tsts || self.all_exms || self.all_bens || self.all_targets
+            || self.tsts.len() > 0 || self.exms.len() > 0 || self.bens.len() > 0
+    }
+
     /// Infer default values for the given project directory.
     pub fn infer_defaults(&mut self, project_dir: &Path) -> CargoResult<()> {
+        if self.user_specified_filter_exists() {
+            // We don't need to infer these if other filters are specified.
+            self.lib_only.infer(false);
+            self.bins.infer(Some(vec![]));
+
+            return Ok(());
+        }
+
         // Note that this may not be equal build_dir when inside a workspace member
         let manifest_path = important_paths::find_root_manifest_for_wd(None, project_dir)?;
         trace!("root manifest_path: {:?}", &manifest_path);
@@ -224,7 +277,7 @@ impl Config {
         );
 
         let targets = package.targets();
-        let (lib, bin) = if targets.iter().any(|x| x.is_lib()) {
+        let (lib_exists, default_bins) = if targets.iter().any(|x| x.is_lib()) {
             (true, None)
         } else {
             let mut bins = targets.iter().filter(|x| x.is_bin());
@@ -239,26 +292,26 @@ impl Config {
                 None => first,
             };
 
-            (false, Some(target.name().to_owned()))
+            (false, Some(vec![target.name().to_owned()]))
         };
 
         trace!(
-            "infer_config_defaults: build_lib: {:?}, build_bin: {:?}",
-            lib,
-            bin
+            "infer_config_defaults: lib_only: {:?}, bins: {:?}",
+            lib_exists,
+            default_bins
         );
 
         // Unless crate target is explicitly specified, mark the values as
         // inferred, so they're not simply ovewritten on config change without
         // any specified value
-        let (lib, bin) = match (&self.build_lib, &self.build_bin) {
-            (&Inferrable::Specified(true), _) => (lib, None),
-            (_, &Inferrable::Specified(Some(_))) => (false, bin),
-            _ => (lib, bin),
+        let (should_build_lib, bin_to_build) = match (&self.lib_only, &self.bins) {
+            (&Inferrable::Specified(true), _) => (lib_exists, None),
+            (_, &Inferrable::Specified(Some(ref bins))) => (false, Some(bins.clone())),
+            _ => (lib_exists, default_bins),
         };
 
-        self.build_lib.infer(lib);
-        self.build_bin.infer(bin);
+        self.lib_only.infer(should_build_lib);
+        self.bins.infer(bin_to_build);
 
         Ok(())
     }
